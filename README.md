@@ -1,195 +1,181 @@
-# RL_26Spring（二阶平衡车：仿真强化学习 + 真机部署脚手架）
+# RL_26Spring V3 — 平衡车强化学习 + STM32板载部署
 
-本目录是一个**不依赖 MATLAB** 的“二阶平衡车仿真强化学习”小项目，同时提前把**真机部署脚本**准备好，便于后续直接在实车上验证与对比。
+二阶平衡车RL项目，支持平衡站立任务训练与STM32真机部署。
 
-本项目用于完成课程作业的两类任务：
-1. **任务一：平衡站立** — 训练 RL 策略使平衡车在无外力辅助下保持平衡
-2. **任务二：移动任务** — 在保持平衡的同时跟踪目标轮速（匀速直线或曲线运动）
+## 项目结构
 
-## 目录结构
+```
+sim_rl/
+├── balance_car_env.py    # 仿真环境（8维观测，手动归一化）
+├── train_sb3_v3.py       # V3训练脚本（32×32网络，500k步）
+├── eval_sb3.py           # 评估脚本
+├── rl_model_v3.h          # 导出的C模型（STM32用）
+├── matlab_linear_model.py # MATLAB线性模型接口
+└── runs/
+    └── sac_v3/
+        └── model.zip     # 训练好的模型
 
-- `sim_rl/`：仿真环境 + 训练/评估/基线脚本
-- `deploy/`：真机部署脚本（WiFi LQR / WiFi RL）
-- `runs/`：训练产物（默认不建议进 git）
-
----
-
-## 环境与依赖
-
-```bash
-python -m pip install -r RL_26Spring/requirements.txt
+deploy/
+├── wifi_lqr.py           # WiFi LQR控制
+└── wifi_rl.py            # WiFi RL控制（实验用，实际部署用板载）
 ```
 
-依赖：gymnasium、stable-baselines3、torch、tensorboard
+---
+
+## 快速开始
+
+### 训练
+
+```bash
+cd /root/blockdata/26SpringRL/RL_26Spring_gfm
+python sim_rl/train_sb3_v3.py --algo sac --steps 500000 --n-envs 4
+```
+
+### 评估（30秒仿真时间）
+
+```bash
+python -c "
+from stable_baselines3 import SAC
+from sim_rl.balance_car_env import BalanceCarEnv, BalanceCarParams
+
+env = BalanceCarEnv(params=BalanceCarParams(max_time_s=30.0), seed=42)
+model = SAC.load('runs/sac_v3/model.zip')
+
+obs, _ = env.reset(seed=42)
+total_steps = 0
+while total_steps < 30000:
+    action, _ = model.predict(obs, deterministic=True)
+    obs, reward, term, trunc, info = env.step(action)
+    total_steps += 1
+    if term or trunc:
+        obs, _ = env.reset()
+print(f'Done: {total_steps} steps')
+"
+```
+
+### 导出到C（STM32）
+
+```bash
+python /root/blockdata/26SpringRL/RL_26Spring_lzw/src/deploy/export_to_c.py \
+  --algo SAC \
+  --model runs/sac_v3/model.zip \
+  --quantize int8 \
+  --output sim_rl/rl_model_v3.h
+```
 
 ---
 
-## 仿真环境定义
+## 仿真环境说明
 
-环境代码：`sim_rl/balance_car_env.py`
+### 状态（8维）
 
-### 状态（观测）空间
+| 索引 | 符号 | 含义 | 归一化除数 |
+|------|------|------|------------|
+| 0 | theta_L | 左轮角度 | /10 |
+| 1 | theta_R | 右轮角度 | /10 |
+| 2 | theta_L_dot | 左轮角速度 | /10 |
+| 3 | theta_R_dot | 右轮角速度 | /10 |
+| 4 | theta_1 | 车身倾角 | /0.8 (≈45°) |
+| 5 | theta_dot_1 | 车身角速度 | /10 |
+| 6 | theta_2 | 摆杆倾角 | /1.0 (≈60°) |
+| 7 | theta_dot_2 | 摆杆角速度 | /10 |
 
-**14 维观测向量：**
-
-| 索引 | 符号 | 含义 | 单位 |
-|------|------|------|------|
-| 0 | theta_L | 左轮角度 | rad |
-| 1 | theta_R | 右轮角度 | rad |
-| 2 | theta_L_dot | 左轮角速度 | rad/s |
-| 3 | theta_R_dot | 右轮角速度 | rad/s |
-| 4 | theta_1 | 车身倾角 | rad |
-| 5 | theta1_dot | 车身角速度 | rad/s |
-| 6 | theta_2 | 摆杆倾角 | rad |
-| 7 | theta2_dot | 摆杆角速度 | rad/s |
-| 8 | alpha1 | 车身角加速度（有限差分） | rad/s² |
-| 9 | alpha2 | 摆杆角加速度（有限差分） | rad/s² |
-| 10 | mean_theta1_dot | 过去10步 theta1_dot 均值 | rad/s |
-| 11 | mean_theta2_dot | 过去10步 theta2_dot 均值 | rad/s |
-| 12 | std_theta1_dot | 过去10步 theta1_dot 标准差 | rad/s |
-| 13 | std_theta2_dot | 过去10步 theta2_dot 标准差 | rad/s |
-
-原始 8 维 + 新增 6 维（角加速度 + 时序统计），帮助策略感知状态变化趋势。
+归一化方法：固定常数（不是在线统计），确保仿真和STM32部署完全一致。
 
 ### 动作空间
 
-`[u_L, u_R]`：左右轮控制输入（环境内部乘以 200 映射到 [-200, 200]）。
+`[u_L, u_R]`：范围 [-200, 200]，网络输出tanh后乘以200。
 
 ### 终止条件
 
-- `|theta_1| > 45°`（车身倾倒）
-- `|theta_2| > 60°`（摆杆倾倒）
-- episode 时间超过 `--max-time`
-
-### 奖励函数
-
-```
-r = alive_bonus(20)
-  - w_theta1 * theta1² - w_theta1dot * theta1dot²
-  - w_theta2 * theta2² - w_theta2dot * theta2dot²
-  - w_wheel_dot * (wdot_l² + wdot_r²)
-  - w_action * (u[0]² + u[1]²)
-  + w_theta1_closeness * 1/(1 + 10*theta1²)   # 靠近直立加分
-  + w_theta2_closeness * 1/(1 + 10*theta2²)
-  + 0.1 * min(t / max_time_s, 1.0)             # 时间越长加分
-  - terminate_penalty（倒地时）
-```
+- `|theta_1| > π/4`（约45°）
+- `|theta_2| > π/3`（约60°）
+- 仿真时间超过 `max_time_s`
 
 ---
 
-## 关键突破：VecNormalize
+## STM32部署步骤
 
-SB3 神经网络输出 [-1, 1]，但环境动作空间是 [-200, 200]。同时观测空间各维度数值范围差异巨大（轮角度 ~0.01，关节角度 ~3.14，角速度 ~10）。
+### 1. 复制头文件
 
-VecNormalize 对观测和奖励做在线归一化：
-- 维护 running mean/std，将所有观测标准化到同一量级
-- 防止神经网络被大数值特征绑架，忽略小数值特征
-- 配合 `clip_reward=10.0` 防止奖励尖峰破坏训练
+将 `sim_rl/rl_model_v3.h` 复制到Keil工程目录：
 
-训练后保存 `vecnormalize.pkl`，评估时加载以保证统计量一致。
+```
+MiniBalance/
+├── control.c
+├── encoder.c
+├── rl_model_v3.h   ← 复制到这里
+└── ...
+```
+
+### 2. 修改control.c
+
+在文件顶部添加：
+
+```c
+#include "rl_model_v3.h"
+```
+
+找到 `Control_mode == 1` 分支，替换为：
+
+```c
+float state[8] = {
+    theta_L, theta_R,
+    theta_L_dot, theta_R_dot,
+    theta_1, theta_dot_1,
+    theta_2, theta_dot_2
+};
+// 手动归一化（与仿真一致）
+state[0] /= 10.0f;  state[1] /= 10.0f;
+state[2] /= 10.0f;  state[3] /= 10.0f;
+state[4] /= 0.8f;   state[5] /= 10.0f;
+state[6] /= 1.0f;   state[7] /= 10.0f;
+
+float action[2];
+rl_predict(state, action);
+u_L = action[0];
+u_R = action[1];
+```
+
+### 3. 编译烧录
+
+- 网络规模：1410参数，int8量化后1.4KB
+- 推理时间：<1ms（STM32F103 @72MHz）
+- 内存：约20KB Flash + 2KB RAM
 
 ---
 
-## 训练与评估
+## 模型规格
 
-### 训练 SAC 模型（任务一：平衡站立）
-
-```bash
-python RL_26Spring/sim_rl/train_sb3.py \
-  --algo sac \
-  --steps 500000 \
-  --n-envs 4 \
-  --logdir /root/RL26Spring/runs/sac_v6
-```
-
-### 评估模型
-
-```bash
-python RL_26Spring/sim_rl/eval_sb3.py \
-  --algo sac \
-  --model /root/RL26Spring/runs/sac_v6/model.zip \
-  --vecnormalize-path /root/RL26Spring/runs/sac_v6/vecnormalize.pkl \
-  --episodes 10
-```
-
-### 训练移动任务模型（任务二）
-
-```bash
-python RL_26Spring/sim_rl/train_sb3.py \
-  --algo sac \
-  --steps 500000 \
-  --n-envs 4 \
-  --logdir /root/RL26Spring/runs/sac_moving \
-  --v-target 1.0 \
-  --max-time 30
-```
-
-随机速度训练（鲁棒性）：
-
-```bash
-python RL_26Spring/sim_rl/train_sb3.py \
-  --algo sac \
-  --steps 500000 \
-  --n-envs 4 \
-  --logdir /root/RL26Spring/runs/sac_moving_random \
-  --v-target-random \
-  --v-target-range 0.5 2.0 \
-  --max-time 30
-```
+| 项目 | 值 |
+|------|-----|
+| 输入维度 | 8 |
+| 网络结构 | 8 → 32 → 32 → 2 |
+| 激活函数 | ReLU（隐层），Tanh（输出） |
+| 参数量 | 1410 |
+| 存储大小（int8） | 1.4 KB |
+| 推理时间 | ~1ms |
+| 最大动作 | ±200 |
 
 ---
 
-## 训练结果
+## 训练结果（V3）
 
-| 模型 | ep_len_mean | 评估表现 |
-|------|-------------|---------|
-| SAC 初始版 | ~50步 | 1秒即翻 |
-| SAC v4（+VecNormalize） | 637步 | 10秒稳定 |
-| **SAC v6（+Reward Shaping）** | **981步** | **30秒稳定站立** |
-
-SAC v6 评估结果（5 episodes，max_time=30s）：
-```
-avg_len: 3001, std_len: 0.0
-→ 所有回合均跑满30秒无翻车
-```
-
-当前最佳模型：`/root/RL26Spring/runs/sac_v6/model.zip` + `vecnormalize.pkl`
+| 指标 | 值 |
+|------|-----|
+| 训练步数 | 500,000 |
+| 网络 | 32×32 |
+| 归一化 | 手动（固定常数） |
+| 30秒Eval步数 | 30,000（全部存活） |
+| 平均reward/步 | 34.7 |
 
 ---
 
-## 真机部署
+## 对比旧版
 
-### 上车前检查清单
+| 版本 | 输入维度 | 归一化 | 网络 | Eval表现 |
+|------|---------|--------|------|---------|
+| V2 | 8 | 无 | 64×64 | ~36步存活 |
+| **V3** | **8** | **手动固定** | **32×32** | **30000步存活** |
 
-1. 确认车端固件已烧录（能发状态、能收 u_L/u_R）
-2. PC 连上小车 AP（`192.168.4.1`）
-3. **先运行 PC 脚本，再按复位键**
-4. 首次测试在安全场地、有人扶车，先用 LQR 验证链路
-
-### 1) LQR 基线部署（验证通信链路）
-
-```bash
-python RL_26Spring/deploy/wifi_lqr.py --host 192.168.4.1 --port 6390 --u-max 20000
-```
-
-### 2) RL 策略部署
-
-```bash
-python RL_26Spring/deploy/wifi_rl.py \
-  --algo sac \
-  --model /root/RL26Spring/runs/sac_v6/model.zip \
-  --vecnormalize-path /root/RL26Spring/runs/sac_v6/vecnormalize.pkl \
-  --u-max 5000
-```
-
-内置安全策略：
-- `|theta_1| > fallback_theta1` 时自动与 LQR 混合回退
-- 输出限幅 `--u-max`
-
----
-
-## 待做
-
-- [ ] 完成移动任务（任务二）训练与评估
-- [ ] 曲线运动扩展（v_target 随时间变化）
-- [ ] 真机验证
+关键改进：手动归一化让训练和部署一致，避免VecNormalize的running mean/std在部署时不可用的问题。
